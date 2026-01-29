@@ -472,7 +472,6 @@
 
     <div class="container">
 
-        <!-- Navbar -->
         <nav class="navbar">
             <div class="brand">
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="url(#logoGradient)"
@@ -515,11 +514,9 @@
             </div>
         </nav>
 
-        <!-- Workers List -->
         <div class="worker-list" id="workerList"></div>
     </div>
 
-    <!-- Logs -->
     <div style="position:fixed; bottom:0; left:0; width:100%; z-index:900;">
         <div class="log-section">
             <div class="log-header" onclick="document.getElementById('logContainer').classList.toggle('open')">
@@ -534,7 +531,6 @@
         <div id="toastMsg"></div>
     </div>
 
-    <!-- Devices Data -->
     <script>
         const AVAILABLE_DEVICES = {{ devices | tojson }};
     </script>
@@ -677,7 +673,6 @@
                 let targetsHtml = '';
                 w.targets.forEach((target, idx) => {
                     const deviceOpts = AVAILABLE_DEVICES.map(d => {
-                        // ...
                         const disabled = d.disabled ? 'disabled' : '';
                         const icon = d.disabled ? '🔒 ' : '';
                         const title = d.disabled_reason || '';
@@ -889,16 +884,11 @@
         };
 
         function initWorkerCharts(worker) {
-            console.log('initWorkerCharts called for worker:', worker.id);
-
             const canvasIOPS = document.getElementById(`chart_iops_${worker.id}`);
             const canvasBW = document.getElementById(`chart_bw_${worker.id}`);
             const canvasLat = document.getElementById(`chart_lat_${worker.id}`);
 
-            console.log('Canvas elements:', { canvasIOPS, canvasBW, canvasLat });
-
             if (!canvasIOPS || !canvasBW || !canvasLat) {
-                console.error('Missing canvas elements for worker', worker.id);
                 return;
             }
 
@@ -923,8 +913,6 @@
                 data: { labels: [], datasets: [{ data: [], borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.1)', borderWidth: 2, fill: true }] },
                 options: commonChartOptions
             });
-
-            console.log('Charts initialized for worker', worker.id);
         }
 
         function updateWorkerCharts(worker, iops, bw, lat) {
@@ -985,6 +973,36 @@
             await executeJob(state.workers, state.executionMode);
         }
 
+        // --- NEW: ABORT FUNCTION ---
+        async function abortJob() {
+            if (!state.currentJobId) return;
+            
+            // Disable button immediately
+            const btnStop = document.getElementById("btnStop");
+            btnStop.disabled = true;
+            btnStop.innerText = "Stopping...";
+            
+            try {
+                const response = await fetch('/stop_job', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: state.currentJobId })
+                });
+                const data = await response.json();
+                
+                if (data.status === "stopped") {
+                    showToast(`Job stopped (Killed ${data.killed_count} processes)`, "info");
+                } else {
+                    showToast(data.message || "Stop request sent", "info");
+                }
+            } catch (err) {
+                console.error("Stop error:", err);
+                showToast("Failed to stop job: " + err, "error");
+                btnStop.disabled = false;
+                btnStop.innerText = "⏹ Stop";
+            }
+        }
+
         async function executeJob(workers, mode) {
             // Reset results for these workers
             workers.forEach(w => {
@@ -1014,12 +1032,8 @@
             renderUI();
 
             const jobId = Date.now().toString();
-            // Start streaming
-            // Note: We need to pass the FULL worker objects including targets to the backend
-            // The backend expects 'workers' array in the POST body
+            state.currentJobId = jobId;
 
-            // Sanitize and structure payload to avoid circular references (charts) 
-            // and ensure config is present for backend
             const payloadWorkers = workers.map(w => ({
                 id: w.id,
                 name: w.name,
@@ -1040,19 +1054,12 @@
                 });
 
                 if (!response.ok) throw new Error("Failed to create job");
-
-                // Start SSE
-                // Store eventSource in state to allow aborting?
-                // Actually the backend stop will kill the process, causing the stream to end or error.
                 connectStream(jobId, workers);
-
-                // Store current Job ID for abort
-                state.currentJobId = jobId;
 
             } catch (e) {
                 showToast(e.message, "error");
-                runAllBtn.disabled = false;
-                workerList.forEach(w => {
+                document.getElementById('btnRun').style.display = 'block';
+                workers.forEach(w => {
                     const original = state.workers.find(o => o.id === w.id);
                     if (original) original.status = 'IDLE';
                 });
@@ -1079,6 +1086,11 @@
                                 calculateFinalMetrics(originalW);
                             }
                         });
+                        
+                        // Reset buttons
+                        const btnStop = document.getElementById("btnStop");
+                        btnStop.disabled = false;
+                        btnStop.innerText = "⏹ Stop";
 
                         if (anyError) {
                             showToast("Benchmark Completed with Errors", "error");
@@ -1087,7 +1099,6 @@
                         }
 
                         renderUI();
-                        // document.getElementById('runAllBtn').disabled = false;
                         source.close();
                         log(`Job Ended: ${status}`);
                     }
@@ -1097,7 +1108,6 @@
                 try {
                     const msg = JSON.parse(e.data);
 
-                    // Handle System messages
                     if (msg.worker_id === 'SYSTEM' || (msg.line && msg.line.startsWith('CRITICAL'))) {
                         log(`❌ ${msg.line}`);
                         return;
@@ -1114,7 +1124,7 @@
                             log(`[DEBUG] ${msg.line}`);
                         } else if (msg.line.startsWith("ERROR:") || msg.line.startsWith("ERR:")) {
                             log(`❌ ${worker ? worker.name : ''}: ${msg.line}`);
-                        } else if (msg.line.startsWith("WARN:")) {
+                        } else if (msg.line.startsWith("WARN:") || msg.line.startsWith("INFO:")) {
                             log(`⚠️ ${worker ? worker.name : ''}: ${msg.line}`);
                         } else if (msg.line.startsWith("INF:")) {
                             const parts = msg.line.split(/\s+/);
@@ -1142,11 +1152,21 @@
             };
 
             source.onerror = () => {
-                showToast("Stream Connection Lost", "error");
+                showToast("Stream Connection Lost or Stopped", "error");
                 source.close();
-                // Check if runAllBtn exists before accessing (legacy support)
-                const btn = document.getElementById('runAllBtn');
-                if (btn) btn.disabled = false;
+                
+                // Reset UI state safely
+                const btnStop = document.getElementById("btnStop");
+                if(btnStop) {
+                    btnStop.disabled = false;
+                    btnStop.innerText = "⏹ Stop";
+                }
+                
+                activeWorkers.forEach(w => {
+                     const originalW = state.workers.find(ow => ow.id === w.id);
+                     if(originalW) originalW.status = 'IDLE';
+                });
+                renderUI();
             };
         }
 
@@ -1181,7 +1201,6 @@
             let content, filename, mimeType;
 
             if (format === 'csv') {
-                // CSV format: Timestamp, IOPS, BW, Latency
                 const rows = ['Timestamp,IOPS,Bandwidth_MBps,Latency_us'];
                 const maxLen = Math.max(
                     worker.results.chartData.iops.length,
@@ -1195,7 +1214,6 @@
                 filename = `${worker.name.replace(/\s+/g, '_')}_results.csv`;
                 mimeType = 'text/csv';
             } else if (format === 'json') {
-                // JSON format
                 const data = {
                     worker: {
                         id: worker.id,
@@ -1217,7 +1235,6 @@
                 mimeType = 'application/json';
             }
 
-            // Trigger download
             const blob = new Blob([content], { type: mimeType });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -1248,5 +1265,4 @@
     </script>
 
 </body>
-
 </html>

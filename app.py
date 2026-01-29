@@ -8,18 +8,35 @@ import shlex
 import os
 import sys
 import stat
+import time
+import signal
 
 app = Flask(__name__)
 
 # Global jobs storage
 jobs = {}
-# Active processes storage
+# Active processes storage - Maps job_id to list of Popen objects
 active_processes = {}
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-IOBENCH_REL_PATH = "./iobench/iobench" 
-IOBENCH_PATH = os.path.join(BASE_DIR, IOBENCH_REL_PATH)
+# Check if running as PyInstaller bundle
+if getattr(sys, 'frozen', False):
+    BASE_DIR = sys._MEIPASS
+
+# Smart Binary Search
+POSSIBLE_PATHS = [
+    os.path.join(BASE_DIR, "iobench", "iobench"),
+    os.path.join(BASE_DIR, "iobench"),
+]
+IOBENCH_PATH = None
+for p in POSSIBLE_PATHS:
+    if os.path.exists(p):
+        IOBENCH_PATH = p
+        break
+if not IOBENCH_PATH:
+    # Fallback default
+    IOBENCH_PATH = os.path.join(BASE_DIR, "iobench")
 
 # --- AUTO-FIX PERMISSIONS ---
 if os.path.exists(IOBENCH_PATH):
@@ -45,6 +62,49 @@ def create_job():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
+# --- NEW STOP ENDPOINT ---
+@app.route("/stop_job", methods=["POST"])
+def stop_job():
+    try:
+        data = request.json
+        job_id = data.get("job_id")
+        
+        if not job_id:
+            return jsonify({"error": "No Job ID provided"}), 400
+
+        print(f"--> STOP REQUEST FOR JOB: {job_id}")
+
+        if job_id in active_processes:
+            procs = active_processes[job_id]
+            killed_count = 0
+            
+            # 1. Terminate gracefully
+            for p in procs:
+                if p.poll() is None:
+                    print(f"    Terminating PID: {p.pid}")
+                    p.terminate()
+                    killed_count += 1
+            
+            # 2. Wait briefly
+            time.sleep(0.5)
+            
+            # 3. Kill forcefully if still alive
+            for p in procs:
+                if p.poll() is None:
+                    print(f"    Killing PID: {p.pid}")
+                    p.kill()
+            
+            # Clean up storage
+            # (Optional: keep it until stream closes, but usually safe to clear)
+            # del active_processes[job_id] 
+            
+            return jsonify({"status": "stopped", "killed_count": killed_count})
+        else:
+            return jsonify({"status": "ignored", "message": "Job not active"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/stream")
 def stream():
     job_id = request.args.get("job_id")
@@ -67,6 +127,8 @@ def stream():
 
             if execution_mode == "sequential":
                 for worker in workers:
+                    # Check if job was stopped (removed from active list or flagged)
+                    # We can check if job_id is still in jobs, or just let run_worker handle it
                     worker["job_id"] = job_id 
                     yield from run_worker(worker)
                 yield "data: STATUS:Done\n\n"
@@ -113,15 +175,25 @@ def stream():
 def run_worker(worker):
     wid = worker.get("id")
     job_id = worker.get("job_id")
+    
+    # Extract config. Prioritize target-specific config if available.
+    targets = worker.get("targets", [])
     config = worker.get("config", {})
-    targets_config = worker.get("targets", [])
+    
+    # Merge config: use first target's settings if available, else worker global
+    if targets:
+        target_conf = targets[0]
+        # Copy relevant keys from target to config for the command builder
+        for k in ['block_size', 'queue_depth', 'duration', 'duration_unit', 'pattern', 'read_percent']:
+            if k in target_conf:
+                config[k] = target_conf[k]
     
     if not os.path.exists(IOBENCH_PATH):
         msg = f"ERROR: Binary NOT FOUND at: {IOBENCH_PATH}"
         yield f"data: {json.dumps({'worker_id': wid, 'line': msg})}\n\n"
         return
 
-    target_devices = [t.get("device") for t in targets_config if t.get("device")]
+    target_devices = [t.get("device") for t in targets if t.get("device")]
     if not target_devices:
         yield f"data: {json.dumps({'worker_id': wid, 'line': 'WARN: No targets defined'})}\n\n"
         return
@@ -134,12 +206,8 @@ def run_worker(worker):
     if config.get("queue_depth"):
         cmd.extend(["-qs", str(config.get("queue_depth"))])
 
-    if "duration" not in config and targets_config:
-        duration = int(targets_config[0].get("duration", 10))
-        duration_unit = targets_config[0].get("duration_unit", "seconds")
-    else:
-        duration = int(config.get("duration", 10))
-        duration_unit = config.get("duration_unit", "seconds")
+    duration = int(config.get("duration", 10))
+    duration_unit = config.get("duration_unit", "seconds")
     
     if duration_unit == "minutes": duration *= 60
     elif duration_unit == "hours": duration *= 3600
@@ -160,15 +228,23 @@ def run_worker(worker):
     yield f"data: {json.dumps({'worker_id': wid, 'line': f'CMD: {cmd_str}'})}\n\n"
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, 
-            text=True,
-            bufsize=1,
-            cwd=BASE_DIR
-        )
+        # Compatibility arguments for older python (3.6)
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "bufsize": 1,
+            "cwd": BASE_DIR
+        }
         
+        # Python 3.7+ uses text=True, older uses universal_newlines=True
+        if sys.version_info >= (3, 7):
+            kwargs["text"] = True
+        else:
+            kwargs["universal_newlines"] = True
+
+        proc = subprocess.Popen(cmd, **kwargs)
+        
+        # Register process for stopping
         if job_id:
             if job_id not in active_processes: active_processes[job_id] = []
             active_processes[job_id].append(proc)
@@ -179,7 +255,11 @@ def run_worker(worker):
                 yield f"data: {json.dumps({'worker_id': wid, 'line': line.strip()})}\n\n"
             
         proc.wait()
-        if proc.returncode != 0:
+        
+        # Check return code. -15 or -9 means killed by us (User Stop)
+        if proc.returncode == -15 or proc.returncode == -9:
+             yield f"data: {json.dumps({'worker_id': wid, 'line': 'INFO: Job stopped by user'})}\n\n"
+        elif proc.returncode != 0:
              err_msg = f"EXIT CODE: {proc.returncode}"
              yield f"data: {json.dumps({'worker_id': wid, 'line': err_msg})}\n\n"
              
@@ -195,38 +275,38 @@ def get_devices():
         if os.path.exists("/usr/bin/lsblk"): cmd = "/usr/bin/lsblk"
         elif os.path.exists("/bin/lsblk"): cmd = "/bin/lsblk"
 
-        # -J for JSON, but NO -d so we see partitions
+        # Compat args
+        kwargs = {"capture_output": True, "text": True}
+        if sys.version_info < (3, 7):
+             kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "universal_newlines": True}
+
         result = subprocess.run(
             [cmd, "-o", "NAME,SIZE,MODEL,TYPE,MOUNTPOINT", "-J"],
-            capture_output=True, text=True
+            **kwargs
         )
-        data = json.loads(result.stdout)
         
-        # Helper to recursively check if any child is mounted as OS
-        def has_os_mount(node):
-            if node.get("mountpoint") in ["/", "/boot", "/boot/efi", "/etc", "/usr"]:
-                return True
-            for child in node.get("children", []):
-                if has_os_mount(child):
+        if result.stdout:
+            data = json.loads(result.stdout)
+            
+            def has_os_mount(node):
+                if node.get("mountpoint") in ["/", "/boot", "/boot/efi", "/etc", "/usr"]:
                     return True
-            return False
+                for child in node.get("children", []):
+                    if has_os_mount(child):
+                        return True
+                return False
 
-        for dev in data.get("blockdevices", []):
-            # We only care about the top-level disks
-            if dev.get("type") != "disk": continue
-            
-            path = f"/dev/{dev['name']}"
-            
-            # Check the disk itself AND all its children (partitions)
-            is_os = has_os_mount(dev)
-            
-            devices.append({
-                "path": path,
-                "size": dev.get("size", "Unknown"),
-                "model": dev.get("model") or "N/A",
-                "disabled": is_os, # This flag tells the UI to disable it
-                "disabled_reason": "OS Disk - Locked for Safety" if is_os else None
-            })
+            for dev in data.get("blockdevices", []):
+                if dev.get("type") != "disk": continue
+                path = f"/dev/{dev['name']}"
+                is_os = has_os_mount(dev)
+                devices.append({
+                    "path": path,
+                    "size": dev.get("size", "Unknown"),
+                    "model": dev.get("model") or "N/A",
+                    "disabled": is_os,
+                    "disabled_reason": "OS Disk - Locked for Safety" if is_os else None
+                })
     except Exception as e:
         print(f"Error getting devices: {e}")
         pass
